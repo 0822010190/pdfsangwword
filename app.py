@@ -13,7 +13,7 @@ from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
 
-from streamlit_paste_button import paste_image_button as pbutton
+import streamlit.components.v1 as components
 
 
 # =========================
@@ -67,7 +67,6 @@ def strip_tabs(text: str) -> str:
 
 
 def collapse_newlines_inside_dollars(text: str) -> str:
-    """Remove any newline chars inside $...$ blocks."""
     def _fix_block(m: re.Match) -> str:
         inner = m.group(1)
         inner = inner.replace("\r", " ").replace("\n", " ")
@@ -179,7 +178,6 @@ def transcribe_with_retry(
 def build_docx(sections: List[Tuple[str, str]]) -> bytes:
     doc = Document()
 
-    # default font = Times New Roman size 13
     style = doc.styles["Normal"]
     font = style.font
     font.name = "Times New Roman"
@@ -211,6 +209,79 @@ def build_docx(sections: List[Tuple[str, str]]) -> bytes:
 
 
 # =========================
+# Paste Image (Ctrl+V) component
+# =========================
+
+def paste_image_component(key: str = "paste_img") -> Optional[bytes]:
+    """
+    Returns image bytes (PNG) if user pasted an image, else None.
+    Works via Streamlit postMessage protocol.
+    """
+    html = f"""
+    <div style="border:1px dashed #999;padding:12px;border-radius:10px;">
+      <div style="font-size:14px;margin-bottom:6px;">
+        <b>Dán ảnh tại đây (Ctrl+V)</b> — chỉ nhận ảnh từ clipboard.
+      </div>
+      <textarea id="ta" placeholder="Click vào đây rồi Ctrl+V..." 
+        style="width:100%;height:110px;resize:vertical;font-size:14px;padding:10px;"></textarea>
+      <div id="status" style="margin-top:8px;color:#555;font-size:13px;"></div>
+    </div>
+
+    <script>
+      const ta = document.getElementById("ta");
+      const status = document.getElementById("status");
+
+      function sendValue(value) {{
+        const msg = {{
+          isStreamlitMessage: true,
+          type: "streamlit:setComponentValue",
+          value: value
+        }};
+        window.parent.postMessage(msg, "*");
+      }}
+
+      ta.addEventListener("paste", async (e) => {{
+        try {{
+          const items = (e.clipboardData || window.clipboardData).items;
+          if (!items) return;
+
+          for (let i = 0; i < items.length; i++) {{
+            const it = items[i];
+            if (it.type && it.type.startsWith("image/")) {{
+              const file = it.getAsFile();
+              const reader = new FileReader();
+              reader.onload = () => {{
+                const dataUrl = reader.result; // data:image/png;base64,...
+                status.textContent = "✅ Đã nhận ảnh từ clipboard.";
+                // Send base64 only to streamlit
+                sendValue(dataUrl);
+              }};
+              reader.readAsDataURL(file);
+              e.preventDefault();
+              return;
+            }}
+          }}
+          status.textContent = "⚠️ Clipboard không có ảnh.";
+        }} catch(err) {{
+          status.textContent = "❌ Lỗi khi đọc clipboard: " + err;
+        }}
+      }});
+    </script>
+    """
+    data_url = components.html(html, height=190, key=key)
+    if not data_url or not isinstance(data_url, str):
+        return None
+    if not data_url.startswith("data:image/"):
+        return None
+    # decode base64
+    try:
+        header, b64 = data_url.split(",", 1)
+        return base64.b64decode(b64)
+    except Exception:
+        return None
+
+
+# =========================
 # Streamlit UI
 # =========================
 
@@ -232,8 +303,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Giới hạn trả lời")
-    vision_max_tokens = st.slider("Vision max_tokens / trang", 1500, 9000, 6500, 250)
-    cleanup_max_tokens = st.slider("Cleanup max_tokens / trang", 1500, 9000, 4500, 250)
+    vision_max_tokens = st.slider("Vision max_tokens / trang", 1500, 8000, 6000, 250)
+    cleanup_max_tokens = st.slider("Cleanup max_tokens / trang", 1500, 8000, 4000, 250)
     temperature = st.slider("temperature", 0.0, 0.8, 0.2, 0.05)
 
     st.divider()
@@ -256,21 +327,11 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Dán ảnh từ clipboard")
-    st.caption("Bấm nút dưới đây rồi Ctrl+V để dán ảnh (trình duyệt cần cho phép Clipboard).")
-
-    paste_result = pbutton(
-        label="📋 Dán ảnh (Ctrl+V)",
-        key="paste_btn_1",
-        errors="ignore",
-    )
-
-    if paste_result.image_data is not None:
-        img = paste_result.image_data.convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        img_bytes = buf.getvalue()
+    img_bytes = paste_image_component(key="paste_1")
+    if img_bytes:
         pasted_images.append(("pasted_image_1.png", img_bytes))
         st.image(img_bytes, caption="Ảnh vừa dán", use_column_width=True)
+    st.caption("Mẹo: dùng Snipping Tool / PrtSc để copy ảnh, sau đó click vào ô và Ctrl+V.")
 
 have_inputs = (uploads and len(uploads) > 0) or (len(pasted_images) > 0)
 
@@ -280,13 +341,11 @@ if st.button("🚀 Chuyển sang Word", type="primary", disabled=(not have_input
     sections: List[Tuple[str, str]] = []
     report_rows: List[Dict[str, str]] = []
 
-    # đếm tổng job (ước lượng để progress)
     total_jobs = 0
     if uploads:
         for up in uploads:
             if up.name.lower().endswith(".pdf"):
-                b = up.read()
-                total_jobs += max(1, pdf_page_count(b))
+                total_jobs += max(1, pdf_page_count(up.read()))
                 up.seek(0)
             else:
                 total_jobs += 1
@@ -309,28 +368,25 @@ if st.button("🚀 Chuyển sang Word", type="primary", disabled=(not have_input
                 page_texts: List[str] = []
                 for pi in range(n_pages):
                     page_no = pi + 1
-
-                    # Render page (try main dpi; fallback if render error)
-                    try:
-                        img = render_pdf_page(data, pi, dpi=dpi_main)
-                        used_dpi = dpi_main
-                    except Exception as e:
+                    with st.spinner(f"Đang đọc {filename} — trang {page_no}/{n_pages} (DPI {dpi_main}) …"):
                         try:
-                            img = render_pdf_page(data, pi, dpi=dpi_fallback)
-                            used_dpi = dpi_fallback
-                        except Exception as e2:
-                            report_rows.append({
-                                "File": filename,
-                                "Trang": str(page_no),
-                                "Trạng thái": "❌ Render lỗi",
-                                "Ghi chú": f"{e} | fallback: {e2}"
-                            })
-                            page_texts.append("")  # giữ chỗ => không rụng trang
-                            done += 1
-                            progress.progress(min(1.0, done / max(1, total_jobs)))
-                            continue
+                            img = render_pdf_page(data, pi, dpi=dpi_main)
+                        except Exception as e:
+                            # render fail -> fallback dpi
+                            try:
+                                img = render_pdf_page(data, pi, dpi=dpi_fallback)
+                            except Exception as e2:
+                                report_rows.append({
+                                    "File": filename,
+                                    "Trang": str(page_no),
+                                    "Trạng thái": "❌ Render lỗi",
+                                    "Ghi chú": f"{e} | fallback: {e2}"
+                                })
+                                page_texts.append("")  # giữ chỗ để không “tụt trang”
+                                done += 1
+                                progress.progress(min(1.0, done / max(1, total_jobs)))
+                                continue
 
-                    with st.spinner(f"Đang đọc {filename} — trang {page_no}/{n_pages} (DPI {used_dpi}) …"):
                         txt, err = transcribe_with_retry(
                             client,
                             vision_model,
@@ -341,26 +397,26 @@ if st.button("🚀 Chuyển sang Word", type="primary", disabled=(not have_input
                             min_chars_ok=min_chars_ok,
                         )
 
-                        # Nếu rỗng => thử fallback DPI (nếu chưa dùng)
-                        if (not txt.strip()) and (dpi_fallback != used_dpi):
-                            with st.spinner(f"Trang {page_no} rỗng → thử lại DPI {dpi_fallback} …"):
-                                try:
-                                    img2 = render_pdf_page(data, pi, dpi=dpi_fallback)
-                                    txt2, err2 = transcribe_with_retry(
-                                        client, vision_model, img2,
-                                        max_tokens=vision_max_tokens,
-                                        temperature=temperature,
-                                        retries=retries,
-                                        min_chars_ok=min_chars_ok,
-                                    )
-                                    if txt2.strip():
-                                        txt, err = txt2, None
-                                    else:
-                                        err = err2 or err
-                                except Exception as e3:
-                                    err = f"{err} | fallback render error: {e3}"
+                        if (not txt.strip()) and err:
+                            # thử fallback DPI nếu DPI chính rỗng
+                            if dpi_fallback != dpi_main:
+                                with st.spinner(f"Trang {page_no} rỗng → thử lại DPI {dpi_fallback} …"):
+                                    try:
+                                        img2 = render_pdf_page(data, pi, dpi=dpi_fallback)
+                                        txt2, err2 = transcribe_with_retry(
+                                            client, vision_model, img2,
+                                            max_tokens=vision_max_tokens,
+                                            temperature=temperature,
+                                            retries=retries,
+                                            min_chars_ok=min_chars_ok,
+                                        )
+                                        if txt2.strip():
+                                            txt, err = txt2, None
+                                        else:
+                                            err = err2 or err
+                                    except Exception as e3:
+                                        err = f"{err} | fallback render error: {e3}"
 
-                        # Cleanup theo từng trang để tránh “rụng”
                         if do_cleanup and txt.strip():
                             with st.spinner(f"Chuẩn hoá trang {page_no} …"):
                                 try:
@@ -375,7 +431,6 @@ if st.button("🚀 Chuyển sang Word", type="primary", disabled=(not have_input
 
                         status = "✅ OK" if txt.strip() else "⚠️ Rỗng"
                         note = "" if txt.strip() else (err or "Không rõ lý do")
-
                         report_rows.append({
                             "File": filename,
                             "Trang": str(page_no),
@@ -383,18 +438,19 @@ if st.button("🚀 Chuyển sang Word", type="primary", disabled=(not have_input
                             "Ghi chú": note
                         })
 
-                        # luôn append để không mất trang
+                        # Giữ chỗ: nếu rỗng vẫn append "" để không mất trang
                         page_texts.append(txt.strip())
 
                     done += 1
                     progress.progress(min(1.0, done / max(1, total_jobs)))
 
-                # ghép theo trang (luôn đủ Trang 1..n)
+                # ghép theo trang (có phân cách rõ)
                 merged_pages = []
                 for i, t in enumerate(page_texts, start=1):
                     merged_pages.append(f"[Trang {i}]\n{t}".strip())
                 merged = "\n\n".join(merged_pages).strip()
-                sections.append((filename, merged))
+
+                sections.append((filename, merged if merged else ""))
 
             else:
                 st.write(f"### 🖼️ Ảnh: {filename}")
@@ -402,8 +458,6 @@ if st.button("🚀 Chuyển sang Word", type="primary", disabled=(not have_input
                     img = Image.open(io.BytesIO(data)).convert("RGB")
                 except Exception as e:
                     report_rows.append({"File": filename, "Trang": "-", "Trạng thái": "❌ Ảnh lỗi", "Ghi chú": str(e)})
-                    done += 1
-                    progress.progress(min(1.0, done / max(1, total_jobs)))
                     continue
 
                 with st.spinner("Đang đọc ảnh…"):
@@ -434,14 +488,7 @@ if st.button("🚀 Chuyển sang Word", type="primary", disabled=(not have_input
     # -------- Handle pasted images --------
     for name, b in pasted_images:
         st.write(f"### 📋 Ảnh dán: {name}")
-        try:
-            img = Image.open(io.BytesIO(b)).convert("RGB")
-        except Exception as e:
-            report_rows.append({"File": name, "Trang": "-", "Trạng thái": "❌ Ảnh dán lỗi", "Ghi chú": str(e)})
-            done += 1
-            progress.progress(min(1.0, done / max(1, total_jobs)))
-            continue
-
+        img = Image.open(io.BytesIO(b)).convert("RGB")
         with st.spinner("Đang đọc ảnh dán…"):
             txt, err = transcribe_with_retry(
                 client, vision_model, img,
@@ -471,7 +518,8 @@ if st.button("🚀 Chuyển sang Word", type="primary", disabled=(not have_input
     with st.spinner("Đang tạo Word…"):
         docx_bytes = build_docx(sections)
 
-    st.success("Xong! Tải Word bên dưới. (Có báo cáo trang nào rỗng/lỗi để kiểm tra.)")
+    st.success("Xong! Tải Word bên dưới. (Có báo cáo trang nào rỗng/lỗi để thầy kiểm tra.)")
+
     st.download_button(
         "⬇️ Tải Word (.docx)",
         data=docx_bytes,
@@ -480,6 +528,7 @@ if st.button("🚀 Chuyển sang Word", type="primary", disabled=(not have_input
     )
 
     st.subheader("📋 Báo cáo đọc trang")
+    # hiển thị report
     if report_rows:
         st.dataframe(report_rows, use_container_width=True)
 
