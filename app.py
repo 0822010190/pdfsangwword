@@ -1,3 +1,10 @@
+# app.py
+# Ảnh / PDF -> Word (.docx) bằng SambaNova (OCR + Toán trong $...$)
+# - Hỗ trợ Ctrl+V dán ảnh (streamlit-paste-button)
+# - Hỗ trợ upload ảnh/PDF
+# - Xuất Word font Times New Roman size 13
+# - Nghiêm ngặt: công thức toán trong $...$
+
 import os
 import re
 import io
@@ -6,30 +13,32 @@ import base64
 import requests
 import streamlit as st
 from PIL import Image
+
 import fitz  # PyMuPDF
 from docx import Document
 from docx.shared import Pt, Inches
+
 from streamlit_paste_button import paste_image_button
 
 
 # =========================
 # SambaNova (OpenAI-compatible)
 # =========================
-SAMBANOVA_BASE_URL = "https://api.sambanova.ai/v1"  # SambaNova Cloud base URL :contentReference[oaicite:2]{index=2}
+SAMBANOVA_BASE_URL = "https://api.sambanova.ai/v1"
 CHAT_COMPLETIONS_URL = f"{SAMBANOVA_BASE_URL}/chat/completions"
 
-DEFAULT_MODEL = "Llama-4-Maverick-17B-128E-Instruct"  # có thể đổi theo model bạn thấy trong portal
+DEFAULT_MODEL = "Llama-4-Maverick-17B-128E-Instruct"
 
 
 # =========================
 # Prompt nghiêm ngặt: LaTeX trong $...$
 # =========================
-SYSTEM_PROMPT = """Bạn là hệ thống OCR + chuyển đổi tài liệu Toán học sang văn bản tiếng Việt để đưa vào Microsoft Word.
+SYSTEM_PROMPT = r"""Bạn là hệ thống OCR + chuyển đổi tài liệu Toán học sang văn bản tiếng Việt để đưa vào Microsoft Word.
 
 RÀNG BUỘC BẮT BUỘC (KHÔNG ĐƯỢC VI PHẠM):
-1) Mọi công thức toán học PHẢI đặt trong dấu $...$ (inline), không dùng \\(...\\), \\[...\\], $$...$$.
+1) Mọi công thức toán học PHẢI đặt trong dấu $...$ (inline). Tuyệt đối KHÔNG dùng \(...\), \[...\], $$...$$.
 2) Giữ nguyên xuống dòng theo bố cục hợp lý của bài toán/lời giải. Không gộp dòng bừa bãi.
-3) Không tự ý đánh lại số thứ tự câu nếu ảnh có số thứ tự.
+3) Không tự ý thay đổi / sắp lại số thứ tự câu nếu ảnh có số thứ tự.
 4) Trả về DUY NHẤT JSON hợp lệ theo schema:
 {
   "pages": [
@@ -42,7 +51,7 @@ RÀNG BUỘC BẮT BUỘC (KHÔNG ĐƯỢC VI PHẠM):
 5) Không thêm lời dẫn, không thêm markdown, không thêm giải thích ngoài JSON.
 """
 
-USER_TASK = """Hãy đọc ảnh (có thể là đề Toán, có công thức, ký hiệu, hình/biểu thức).
+USER_TASK = r"""Hãy đọc ảnh (có thể là đề Toán, có công thức, ký hiệu, hình/biểu thức).
 - OCR chính xác tối đa.
 - Với ký hiệu toán: chuyển sang LaTeX và bắt buộc đặt trong $...$.
 - Văn bản tiếng Việt đúng chính tả (nếu nhìn thấy).
@@ -69,30 +78,30 @@ def pil_to_png_bytes(img: Image.Image) -> bytes:
 
 
 def render_pdf_to_images(pdf_bytes: bytes, dpi: int = 200) -> list[bytes]:
-    """
-    Render PDF pages -> list of PNG bytes using PyMuPDF.
-    """
+    """Render PDF pages -> list of PNG bytes using PyMuPDF."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    out = []
+    out: list[bytes] = []
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
+
     for i in range(doc.page_count):
         page = doc.load_page(i)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         out.append(pix.tobytes("png"))
+
     doc.close()
     return out
 
 
 def call_sambanova_vision(image_png_bytes: bytes, model: str, api_key: str, temperature: float = 0.0) -> dict:
     """
-    OpenAI multimodal format (text + image_url base64 data URL) :contentReference[oaicite:3]{index=3}
+    OpenAI multimodal format: messages content includes image_url with base64 data URL.
     """
     data_url = image_bytes_to_data_url(image_png_bytes, mime="image/png")
 
     payload = {
         "model": model,
-        "temperature": temperature,
+        "temperature": float(temperature),
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -111,7 +120,7 @@ def call_sambanova_vision(image_png_bytes: bytes, model: str, api_key: str, temp
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(CHAT_COMPLETIONS_URL, headers=headers, data=json.dumps(payload), timeout=120)
+    resp = requests.post(CHAT_COMPLETIONS_URL, headers=headers, data=json.dumps(payload), timeout=180)
     if resp.status_code != 200:
         raise RuntimeError(f"SambaNova API lỗi {resp.status_code}: {resp.text}")
 
@@ -121,16 +130,16 @@ def call_sambanova_vision(image_png_bytes: bytes, model: str, api_key: str, temp
 def extract_json_from_model_text(text: str) -> dict:
     """
     Model được yêu cầu trả JSON thuần. Nhưng để chắc ăn:
-    - tìm khối JSON lớn nhất
+    - thử json.loads trực tiếp
+    - nếu fail: tìm khối JSON lớn nhất ở cuối
     """
-    text = text.strip()
-    # nếu đã là JSON
+    text = (text or "").strip()
+
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # tìm đoạn {...} lớn nhất
     m = re.search(r"\{[\s\S]*\}\s*$", text)
     if not m:
         raise ValueError("Không tìm thấy JSON trong phản hồi model.")
@@ -140,18 +149,19 @@ def extract_json_from_model_text(text: str) -> dict:
 def enforce_math_dollars(s: str) -> str:
     """
     Hậu kiểm đơn giản:
-    - đổi \\( ... \\) -> $...$
-    - đổi \\[ ... \\] -> $...$
+    - đổi \( ... \) -> $...$
+    - đổi \[ ... \] -> $...$
     - đổi $$...$$ -> $...$
-    (Không “render”, chỉ chuẩn hoá dấu)
     """
+    if not s:
+        return s
     s = re.sub(r"\\\(([\s\S]*?)\\\)", r"$\1$", s)
     s = re.sub(r"\\\[([\s\S]*?)\\\]", r"$\1$", s)
     s = re.sub(r"\$\$([\s\S]*?)\$\$", r"$\1$", s)
     return s
 
 
-def build_docx(pages: list[dict], images_per_page: list[bytes] | None = None, title: str = "Chuyển đổi") -> bytes:
+def build_docx(pages: list[dict], images_per_page: list[bytes] | None = None, title: str = "Kết quả chuyển đổi") -> bytes:
     doc = Document()
 
     # Set default font Times New Roman size 13
@@ -159,36 +169,72 @@ def build_docx(pages: list[dict], images_per_page: list[bytes] | None = None, ti
     style.font.name = "Times New Roman"
     style.font.size = Pt(13)
 
+    # Tiêu đề
     doc.add_paragraph(title)
 
     for idx, page in enumerate(pages):
         page_index = page.get("page_index", idx + 1)
-        content = page.get("content", "")
+        content = enforce_math_dollars(page.get("content", "") or "")
 
-        content = enforce_math_dollars(content)
-
-        doc.add_paragraph(f"\n--- Trang {page_index} ---\n")
+        doc.add_paragraph("")
+        doc.add_paragraph(f"--- Trang {page_index} ---")
+        doc.add_paragraph("")
 
         # giữ xuống dòng: mỗi dòng -> 1 paragraph
         for line in content.splitlines():
-            # giữ dòng trống
             if line.strip() == "":
                 doc.add_paragraph("")
             else:
                 doc.add_paragraph(line)
 
-        # chèn ảnh trang (tuỳ chọn)
+        # chèn ảnh gốc (tuỳ chọn)
         if images_per_page and idx < len(images_per_page):
             doc.add_paragraph("")
             try:
                 doc.add_picture(io.BytesIO(images_per_page[idx]), width=Inches(6.2))
             except Exception:
-                # nếu ảnh quá lớn/ lỗi thì bỏ qua
                 pass
 
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+def paste_result_to_pil(pasted) -> Image.Image | None:
+    """
+    streamlit-paste-button thường trả về PasteResult (không phải PIL).
+    Ta cố lấy ảnh theo nhiều khả năng: .image, .bytes, .data...
+    """
+    if pasted is None:
+        return None
+
+    # TH1: đã là PIL Image
+    if isinstance(pasted, Image.Image):
+        return pasted.convert("RGB")
+
+    # TH2: có thuộc tính .image (PIL)
+    if hasattr(pasted, "image") and getattr(pasted, "image") is not None:
+        img = getattr(pasted, "image")
+        if isinstance(img, Image.Image):
+            return img.convert("RGB")
+
+    # TH3: có bytes
+    if hasattr(pasted, "bytes") and getattr(pasted, "bytes"):
+        b = getattr(pasted, "bytes")
+        try:
+            return Image.open(io.BytesIO(b)).convert("RGB")
+        except Exception:
+            pass
+
+    # TH4: một số bản dùng .data
+    if hasattr(pasted, "data") and getattr(pasted, "data"):
+        b = getattr(pasted, "data")
+        try:
+            return Image.open(io.BytesIO(b)).convert("RGB")
+        except Exception:
+            pass
+
+    return None
 
 
 # =========================
@@ -203,7 +249,7 @@ with st.sidebar:
         "SambaNova API Key",
         value=st.session_state.get("SAMBANOVA_API_KEY", os.getenv("SAMBANOVA_API_KEY", "")),
         type="password",
-        help="API key dùng ở server. Không nên hardcode.",
+        help="Không nên hardcode key. Nên đặt biến môi trường SAMBANOVA_API_KEY.",
     )
     model = st.text_input("Model", value=DEFAULT_MODEL)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
@@ -211,15 +257,20 @@ with st.sidebar:
     include_page_images = st.checkbox("Chèn ảnh gốc vào Word (mỗi trang)", value=False)
 
 st.subheader("1) Dán ảnh bằng Ctrl+V hoặc tải file")
+
 col1, col2 = st.columns(2)
 
 with col1:
     pasted = paste_image_button("📋 Dán ảnh từ Clipboard (Ctrl+V)")
     pasted_img_bytes = None
+
     if pasted is not None:
-        # pasted là PIL image
-        pasted_img_bytes = pil_to_png_bytes(pasted)
-        st.image(pasted, caption="Ảnh đã dán", use_container_width=True)
+        img = paste_result_to_pil(pasted)
+        if img is None:
+            st.error("Không lấy được ảnh từ Clipboard. Hãy thử dán lại hoặc tải file lên.")
+        else:
+            pasted_img_bytes = pil_to_png_bytes(img)
+            st.image(img, caption="Ảnh đã dán", use_container_width=True)
 
 with col2:
     up = st.file_uploader("Tải lên ảnh hoặc PDF", type=["png", "jpg", "jpeg", "webp", "pdf"])
@@ -236,14 +287,17 @@ convert_btn = st.button("🚀 Chuyển sang Word", type="primary", disabled=not 
 
 if convert_btn and api_key:
     try:
-        images = []
+        images: list[bytes] = []
+
+        # Ưu tiên ảnh dán Ctrl+V
         if pasted_img_bytes:
             images = [pasted_img_bytes]
         elif uploaded_bytes and up is not None:
-            if up.type == "application/pdf" or up.name.lower().endswith(".pdf"):
+            # Upload PDF
+            if (up.type == "application/pdf") or up.name.lower().endswith(".pdf"):
                 images = render_pdf_to_images(uploaded_bytes, dpi=dpi)
             else:
-                # ảnh thường
+                # Upload ảnh
                 img = Image.open(io.BytesIO(uploaded_bytes)).convert("RGB")
                 images = [pil_to_png_bytes(img)]
         else:
@@ -252,20 +306,27 @@ if convert_btn and api_key:
 
         st.info(f"Số trang/ảnh cần xử lý: {len(images)}")
 
-        pages_out = []
+        pages_out: list[dict] = []
+
         for i, img_bytes in enumerate(images, start=1):
             with st.spinner(f"Đang OCR + hiểu nội dung trang {i}..."):
-                resp = call_sambanova_vision(img_bytes, model=model, api_key=api_key, temperature=temperature)
+                resp = call_sambanova_vision(
+                    img_bytes,
+                    model=model,
+                    api_key=api_key,
+                    temperature=temperature,
+                )
+
                 # OpenAI-compatible: resp['choices'][0]['message']['content']
                 content_text = resp["choices"][0]["message"]["content"]
                 data = extract_json_from_model_text(content_text)
 
-                # kỳ vọng data["pages"] có 1 page; nếu model trả nhiều, vẫn gom
                 if "pages" in data and isinstance(data["pages"], list) and len(data["pages"]) > 0:
-                    # nếu có nhiều pages, gán lại page_index hợp lệ
                     for p in data["pages"]:
                         if "page_index" not in p:
                             p["page_index"] = i
+                        if "content" in p and isinstance(p["content"], str):
+                            p["content"] = enforce_math_dollars(p["content"])
                         pages_out.append(p)
                 else:
                     # fallback
@@ -274,7 +335,7 @@ if convert_btn and api_key:
         # Sort theo page_index để ổn định
         pages_out.sort(key=lambda x: x.get("page_index", 0))
 
-        st.success("Xử lý xong. Xem preview bên dưới.")
+        st.success("Xử lý xong. Preview nội dung:")
         for p in pages_out:
             st.markdown(f"### Trang {p.get('page_index')}")
             st.text(p.get("content", ""))
